@@ -3,80 +3,72 @@ require 'multi_json'
 
 module OmniAuth
   module Strategies
-    class Tqq < OmniAuth::Strategies::OAuth
-      option :name, 'tqq'
-      option :sign_in, true
-      def initialize(*args)
-        super
-        # taken from https://github.com/intridea/omniauth/blob/0-3-stable/oa-oauth/lib/omniauth/strategies/oauth/tqq.rb#L15-24
-        options.client_options = {
-          :access_token_path => '/cgi-bin/access_token',
-          :authorize_path => '/cgi-bin/authorize',
-          :http_method => :get,
-          :nonce => nonce,
-          :realm => 'OmniAuth',
-          :request_token_path => '/cgi-bin/request_token',
-          :scheme => :query_string,
-          :site => 'https://open.t.qq.com',
-        }
-      end
+    class Tqq < OmniAuth::Strategies::OAuth2
+      option :name, "tqq"
 
-      # https://github.com/intridea/omniauth/blob/0-3-stable/oa-oauth/lib/omniauth/strategies/oauth/tqq.rb#L28-30
-      def nonce
-        Base64.encode64(OpenSSL::Random.random_bytes(32)).gsub(/\W/, '')[0, 32]
-      end
+      # This is where you pass the options you would pass when
+      # initializing your consumer from the OAuth gem.
+      option :client_options, {
+        :site           => "https://open.t.qq.com",
+        :authorize_url  => "/cgi-bin/oauth2/authorize",
+        :token_url      => "/cgi-bin/oauth2/access_token"
+      }
+      option :token_params, {
+        :parse          => :query
+      }
 
-      def consumer
-        consumer = ::OAuth::Consumer.new(options.consumer_key, options.consumer_secret, options.client_options)
-        consumer
-      end
-
-      uid { raw_info['data']['openid'] }
+      # These are called after authentication has succeeded. If
+      # possible, you should try to set the UID without making
+      # additional calls (if the user id is returned with the token
+      # or as a URI parameter). This may not be possible with all
+      # providers.
+      uid {
+        Rails.logger.info raw_info.inspect
+        raw_info["openid"]
+      }
 
       info do
         {
-          :nickname => raw_info['data']['nick'],
-          :email => (raw_info['data']['email'] if raw_info['data']['email'].present?),
-          :name => raw_info['data']['name'],
-          :location => raw_info['data']['location'],
-          :image => (raw_info['data']['head']+'/40' if raw_info['data']['head'].present?),
-          :description => raw_info['data']['introduction'],
-          :urls => {
-            'Tqq' => 't.qq.com/' + raw_info['data']['name']
-          }
+          :name        => raw_info['name'],
+          :nickname    => raw_info['nick'],
+          :email       => raw_info['email'],
+          :location    => raw_info['location'],
+          :image       => raw_info['head'],
+          :description => raw_info['introduction']
         }
       end
 
       extra do
-        # rename some attribute to my own needs.
-        raw_info['gender'] ||= raw_info['data']['sex'] == 1 ? 'm' : (raw_info['data']['sex'] == 2 ? 'f' : '')
-        raw_info['followers_count'] ||= raw_info['data']['fansnum']
-        raw_info['friends_count'] ||= raw_info['data']['idolnum']
-        { :raw_info => raw_info }
+        {
+          'raw_info' => raw_info
+        }
       end
 
-      #taken from https://github.com/intridea/omniauth/blob/0-3-stable/oa-oauth/lib/omniauth/strategies/oauth/tsina.rb#L52-67
-      def request_phase
-        request_token = consumer.get_request_token(:oauth_callback => callback_url)
-        session['oauth'] ||= {}
-        session['oauth'][name.to_s] = {'callback_confirmed' => true, 'request_token' => request_token.token, 'request_secret' => request_token.secret}
+      credentials do
+        hash = {'token' => access_token.token}
+        hash.merge!('openid' => @openid) if @openid
+        hash.merge!('openkey' => @openkey) if @openkey
+        hash.merge!('refresh_token' => access_token.refresh_token) if access_token.expires? && access_token.refresh_token
+        hash.merge!('expires_at' => access_token.expires_at) if access_token.expires?
+        hash.merge!('expires' => access_token.expires?)
+        hash
+      end
 
-        if request_token.callback_confirmed?
-          redirect request_token.authorize_url(options[:authorize_params])
-        else
-          redirect request_token.authorize_url(options[:authorize_params].merge(:oauth_callback => callback_url))
-        end
-
-      rescue ::Timeout::Error => e
-        fail!(:timeout, e)
-      rescue ::Net::HTTPFatalError, ::OpenSSL::SSL::SSLError => e
-        fail!(:service_unavailable, e)
+      def callback_phase
+        # 伪造防csrf的state，腾讯微博NMMP
+        request.params['state'] = session['omniauth.state']
+        @openid = request.params["openid"]
+        @openkey = request.params["openkey"]
+        super
       end
 
       def raw_info
-        @raw_info ||= MultiJson.decode(access_token.get('http://open.t.qq.com/api/user/info?format=json').body)
-      rescue ::Errno::ETIMEDOUT
-        raise ::Timeout::Error
+        @raw_info ||= access_token.get("/api/user/info", params: {
+          openid: @openid,
+          oauth_consumer_key: access_token.client.id,
+          access_token: access_token.token,
+          oauth_version: '2.a'
+        }, parse: :json).parsed["data"]
       end
     end
   end
